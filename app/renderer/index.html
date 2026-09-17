@@ -101,6 +101,16 @@
            #viewer is the scroller. -->
       <div id="pageNow" hidden><span id="pageNowText">—</span></div>
 
+      <!-- The one piece of persistent playback chrome the app has, top
+           center over the page. play() already toggles to pause() itself
+           when something is speaking, so this button just calls it either
+           way -- same as the Space key. Outside #viewer for the same reason
+           #pageNow is: #viewer is the scroller. -->
+      <button id="playToggle" class="iconBtn floating" title="Play (Space)" aria-label="Play" hidden>
+        <svg class="iconPlay" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4.5 3.3v9.4a.6.6 0 0 0 .92.5l7.4-4.7a.6.6 0 0 0 0-1l-7.4-4.7a.6.6 0 0 0-.92.5Z"/></svg>
+        <svg class="iconPause" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" hidden><rect x="4" y="3" width="3" height="10" rx="1"/><rect x="9" y="3" width="3" height="10" rx="1"/></svg>
+      </button>
+
       <!-- Where a link goes, in the corner a browser puts it. -->
       <div id="linkPeek" hidden><span id="linkPeekIcon"></span><span id="linkPeekText"></span></div>
 

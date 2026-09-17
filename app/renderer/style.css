@@ -692,6 +692,24 @@ button.wide {
 #viewer:hover ~ #pageNow, #app:hover #pageNow { opacity: 1; }
 #pageNow.reading { color: var(--accent); border-color: color-mix(in oklab, var(--accent) 45%, var(--border)); opacity: 1; }
 
+/* ---------------- play / pause ----------------
+ *
+ * Top center, over the page. Fixed for the same reason #pageNow is: #viewer
+ * is the scroller, so an absolutely placed child would scroll away with the
+ * pages. Its `left` is set from the viewer's own box in JS (updatePageNow),
+ * so it stays centered over the reading column when either side panel
+ * toggles, the same technique #pageNow uses for its own `right`.
+ */
+#playToggle {
+  position: fixed;
+  top: 14px;
+  z-index: 4;
+  width: 36px;
+  height: 36px;
+  transform: translateX(-50%);
+}
+#playToggle.playing { color: var(--accent); border-color: color-mix(in oklab, var(--accent) 45%, var(--border)); }
+
 /* ---------------- where a link goes ----------------
  *
  * Bottom left, the corner every browser uses for this, and for the same

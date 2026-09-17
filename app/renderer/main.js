@@ -46,6 +46,7 @@ const $ = (id) => document.getElementById(id);
 const el = {
   file: $("file"), title: $("docTitle"), openSite: $("openSite"),
   pageNow: $("pageNow"), pageNowText: $("pageNowText"), pageMenu: $("pageMenu"),
+  playToggle: $("playToggle"),
   voice: $("voice"), rate: $("rate"), rateOut: $("rateOut"),
   linkPeek: $("linkPeek"), linkPeekIcon: $("linkPeekIcon"), linkPeekText: $("linkPeekText"),
   fsHint: $("fsHint"),
@@ -340,7 +341,7 @@ function setDocHeader(title, siteUrl) {
 
 /** "9 / 26", bottom right, and marked while something is being read. */
 function updatePageNow() {
-  if (!doc) { el.pageNow.hidden = true; return; }
+  if (!doc) { el.pageNow.hidden = true; el.playToggle.hidden = true; return; }
   const mid = pageAtOffset(el.viewer.scrollTop + el.viewer.clientHeight / 2);
   const at = speaking?.pn ?? mid?.pn ?? 1;
   el.pageNow.hidden = false;
@@ -350,6 +351,18 @@ function updatePageNow() {
   el.pageNow.style.right = `${Math.max(12, Math.round(innerWidth - box.right + 18))}px`;
   el.pageNow.classList.toggle("reading", !!playing);
   el.pageNowText.textContent = `${at} / ${doc.numPages}`;
+
+  // Same fixed/repositioned-from-the-viewer-box treatment as #pageNow just
+  // above, centered instead of right-aligned. play() already toggles itself
+  // to pause() when something is speaking (see the Space key handler), so
+  // this button just needs to look right and call it.
+  el.playToggle.hidden = false;
+  el.playToggle.style.left = `${Math.round(box.left + box.width / 2)}px`;
+  el.playToggle.classList.toggle("playing", !!playing);
+  el.playToggle.title = playing ? "Pause (Space)" : "Play (Space)";
+  el.playToggle.setAttribute("aria-label", playing ? "Pause" : "Play");
+  el.playToggle.querySelector(".iconPlay").hidden = playing;
+  el.playToggle.querySelector(".iconPause").hidden = !playing;
 }
 
 /** Fill the Contents tab for whichever format is open. */
@@ -1709,6 +1722,19 @@ function wireEpubInput(p) {
   // The menu is in the parent document, so a press inside the frame has to
   // dismiss it explicitly -- the parent never sees this one.
   cd.addEventListener("mousedown", closeMenu);
+
+  // Word hover-preview and double-click-to-play, epub side -- see the note
+  // above openMenu. toClient() puts iframe-local coordinates back in outer
+  // client space, same as the contextmenu handler just above.
+  cd.addEventListener("mousemove", (e) => {
+    const { x, y } = toClient(e);
+    handleWordHover(p, x, y);
+  });
+  cd.addEventListener("mouseleave", () => setHoveredWord(null));
+  cd.addEventListener("dblclick", (e) => {
+    const { x, y } = toClient(e);
+    handleWordDblClick(p, x, y);
+  });
 }
 
 /*
@@ -2736,6 +2762,23 @@ const pad = (r) => ({
 });
 
 /*
+ * `pad` was tuned for a whole LINE band -- 28% extra height and a 14%
+ * upward shift read as "generous" there because they're absorbing a full
+ * line's ascenders/descenders. Applied to a single word (16's word cursor,
+ * and the hover outline below) the same ratios look loose: the box floats
+ * above the word and overhangs well past its edges, which is exactly what
+ * "not positioned perfectly on the word" describes. This hugs the glyphs
+ * instead -- a snug highlighter pill, Speechify's own look, rather than a
+ * shrunk line band.
+ */
+const padWord = (r) => ({
+  x: clamp01(r.x - r.h * 0.05),
+  y: clamp01(r.y - r.h * 0.05),
+  w: r.w + r.h * 0.10,
+  h: r.h * 1.10,
+});
+
+/*
  * The overlay's viewBox is a unit square stretched independently in x and y
  * over whatever pixel box the page actually rendered at (preserveAspectRatio
  * ="none", see paintRegions' note on this) -- so a single numeric rx/ry
@@ -2811,7 +2854,7 @@ function paintBand(p, rects) {
 // Claude's own accent coral rather than the generic reading-app amber, per
 // ticket ask: word-level highlighting should read as this app's highlight,
 // not a stock yellow marker.
-const CURSOR_TINT = "rgba(217, 119, 87, 0.30)";
+const CURSOR_TINT = "rgba(217, 119, 87, 0.34)";
 const CURSOR_UNDERLINE = "rgba(196, 98, 66, 0.92)";
 const CURSOR_DIM = "rgba(10, 12, 18, 0.24)";
 
@@ -2837,7 +2880,7 @@ function paintWordCursor(p, sentence, wordIdxs, lineRects) {
   const wordBoxes = wordIdxs
     .map((i) => words[i])
     .filter(Boolean)
-    .flatMap((w) => w.rects.map(pad));
+    .flatMap((w) => w.rects.map(padWord));
   if (!wordBoxes.length) return;
 
   if (cursorStyle.key === "underline") {
@@ -2955,6 +2998,7 @@ function repaint() {
     if (loadingSentence?.pn === p.pn && !isSame(speaking, loadingSentence)) {
       paintLoading(p, p.sentences[loadingSentence.si]);
     }
+    if (hoveredWord?.pn === p.pn) paintWordHover(p);
   }
 }
 
@@ -3198,6 +3242,17 @@ async function speakOne(c) {
   playingSpeed = synthSpeed;
   audioEl.playbackRate = Number(el.rate.value) / playingSpeed;
 
+  // Double-click on a word (handleWordDblClick) asks to start mid-sentence,
+  // not just at its first word. The whole sentence is still synthesized and
+  // played start-to-end as one clip -- Kokoro has no notion of "resume from
+  // here" -- so this seeks the *already-loaded* clip to the target word's
+  // own timing span instead. wordsAt(audioEl.currentTime) in the word loop
+  // below then just naturally picks up from wherever that lands.
+  if (c.wordIdx != null) {
+    const span = currentSpans.find((sp) => sp.words.includes(c.wordIdx));
+    if (span) audioEl.currentTime = span.start;
+  }
+
   audioEl.onended = () => {
     if (gen !== generation) return;
     timings.push(performance.now() - startedAt);
@@ -3417,13 +3472,106 @@ function epubHitTest(p, clientX, clientY) {
  * click is the end of a selection drag, which is someone quoting a passage
  * for a note, not asking to be read to.
  *
- * A left click does NOT start playback, and hovering does nothing at all.
- * The page is a document first: click to place a cursor, drag to select,
- * click a link to follow it. Reading aloud is something you ask for --
- * right-click, or press P -- rather than something a stray pointer begins.
- * That was the whole complaint about hover-to-play, and it was fair: you
- * cannot use a document you cannot rest the mouse on.
+ * A single left click does NOT start playback -- the page is a document
+ * first: click to place a cursor, drag to select, click a link to follow it.
+ * Reading aloud from an arbitrary click is something you ask for unambiguously
+ * -- right-click, press P, or (below) double-click a specific word -- rather
+ * than something a stray pointer begins. That was the whole complaint about
+ * hover-to-play, and it was fair: you cannot use a document you cannot rest
+ * the mouse on. Hovering itself still does nothing but preview -- a quiet
+ * outline on whatever word is under the pointer, so double-click has
+ * something to aim at, never a sound.
  */
+
+/* --------------------------------------------- word hover / double-click */
+
+// {pn, si, wi} of the word currently under the pointer, or null. wi indexes
+// the same (cached, filtered) array getWordRects returns and the server's
+// phoneme spans already use -- see wordHitTest and speakOne's wordIdx seek.
+let hoveredWord = null;
+
+/**
+ * A page-fraction point -> the fraction space word rects were computed in.
+ * PDF word rects (getWordRects) are fractions of textLayerDiv's own box;
+ * epub word rects (epubRangeRects) are fractions of the chapter document's
+ * own clientWidth/scrollHeight, in the iframe's unscaled coordinate system.
+ * Mirrors hitTest/epubHitTest's own point conversion exactly, so a hit here
+ * lands on the same word a click there would have.
+ */
+function pointToFraction(p, clientX, clientY) {
+  if (p.iframe) {
+    const idoc = p.iframe.contentDocument;
+    if (!idoc) return null;
+    const ib = p.iframe.getBoundingClientRect();
+    const root = idoc.documentElement;
+    const width = root.clientWidth || 1, height = root.scrollHeight || 1;
+    return { x: ((clientX - ib.left) / scale) / width, y: ((clientY - ib.top) / scale) / height };
+  }
+  const b = p.textLayerDiv.getBoundingClientRect();
+  return { x: (clientX - b.left) / b.width, y: (clientY - b.top) / b.height };
+}
+
+/**
+ * Which word, if any, sits under this point -- reusing the cheap sentence-
+ * level hitTest/epubHitTest first (both already safe at mousemove frequency,
+ * see epubHitTest's own note), then paying the one hit sentence's per-word
+ * layout cost (getWordRects, cached after the first call) rather than
+ * scanning every sentence's words on every pixel the pointer crosses.
+ */
+function wordHitTest(p, clientX, clientY) {
+  const si = hitTest(p, clientX, clientY);
+  if (si == null) return null;
+  const s = p.sentences[si];
+  const pt = pointToFraction(p, clientX, clientY);
+  if (!pt) return null;
+  const words = getWordRects(p, s);
+  const wi = words.findIndex((w) => w.rects.some((r) =>
+    pt.x >= r.x - 0.004 && pt.x <= r.x + r.w + 0.004 && pt.y >= r.y - 0.01 && pt.y <= r.y + r.h + 0.01));
+  return wi < 0 ? null : { pn: p.pn, si, wi };
+}
+
+function sameWord(a, b) {
+  return a === b || (a && b && a.pn === b.pn && a.si === b.si && a.wi === b.wi);
+}
+
+function setHoveredWord(next) {
+  if (sameWord(hoveredWord, next)) return;
+  hoveredWord = next;
+  // Only fires on an actual word change, not per pixel -- the same
+  // frequency the reading word-loop already repaints at (startWordLoop).
+  repaint();
+}
+
+function handleWordHover(p, clientX, clientY) {
+  setHoveredWord(wordHitTest(p, clientX, clientY));
+}
+
+/** Unambiguous, deliberate, and never confusable with a text-selection drag. */
+function handleWordDblClick(p, clientX, clientY) {
+  const hit = wordHitTest(p, clientX, clientY);
+  if (!hit) return;
+  stop();
+  play({ pn: hit.pn, si: hit.si, wordIdx: hit.wi });
+}
+
+/**
+ * A quiet outline on whatever word the pointer is over -- pure preview, see
+ * the note above. Same rounded, snug treatment as the reading word cursor
+ * (padWord + cornerRadius) but colorless, so it never reads as "this is the
+ * word being spoken" when nothing is speaking at all.
+ */
+function paintWordHover(p) {
+  if (!hoveredWord || hoveredWord.pn !== p.pn) return;
+  const s = p.sentences[hoveredWord.si];
+  const w = s && getWordRects(p, s)[hoveredWord.wi];
+  if (!w) return;
+  for (const b of w.rects.map(padWord)) {
+    p.svg.append(rect(b.x, b.y, b.w, b.h, "rgba(128, 128, 140, 0.14)", {
+      stroke: "rgba(128, 128, 140, 0.5)", "stroke-width": 1.2,
+      "vector-effect": "non-scaling-stroke", ...cornerRadius(p, b.h, 5),
+    }));
+  }
+}
 
 /* ------------------------------------------------- the page's own menu */
 
@@ -3498,6 +3646,23 @@ el.pages.addEventListener("contextmenu", (ev) => {
   ev.preventDefault();
   const p = pages.get(Number(div.dataset.page));
   openMenu(menuTargetAt(p, ev.clientX, ev.clientY), ev.clientX, ev.clientY);
+});
+
+// Word hover-preview and double-click-to-play, PDF side. An epub chapter's
+// text lives inside its own iframe document, whose mouse events never bubble
+// out here -- that side is wired directly on the iframe in wireEpubInput.
+el.pages.addEventListener("mousemove", (ev) => {
+  const div = ev.target.closest(".page");
+  const p = div && pages.get(Number(div.dataset.page));
+  if (!p || p.iframe || !p.rendered) { setHoveredWord(null); return; }
+  handleWordHover(p, ev.clientX, ev.clientY);
+});
+el.pages.addEventListener("mouseleave", () => setHoveredWord(null));
+el.pages.addEventListener("dblclick", (ev) => {
+  const div = ev.target.closest(".page");
+  const p = div && pages.get(Number(div.dataset.page));
+  if (!p || p.iframe || !p.rendered) return;
+  handleWordDblClick(p, ev.clientX, ev.clientY);
 });
 
 // Dismissal: anywhere else, any scroll, Escape. Mousedown rather than click,
@@ -3599,8 +3764,11 @@ function setCursorStyle(i) {
   repaint();
 }
 
+// Shipped default is "tint" -- a real solid highlighter pill on the word,
+// the Speechify-style look that was asked for -- rather than "dim"'s
+// nested-spotlight effect, which has no colored mark on the word at all.
 const startCursor = CURSOR_STYLES.findIndex(
-  (c) => c.key === (new URL(location.href).searchParams.get("cursor") ?? loadPref("blitz.cursor", "dim")),
+  (c) => c.key === (new URL(location.href).searchParams.get("cursor") ?? loadPref("blitz.cursor", "tint")),
 );
 setCursorStyle(startCursor < 0 ? 0 : startCursor);
 
@@ -3708,6 +3876,7 @@ for (const d of sections) {
 // ---------------------------------------------------------------- wiring
 
 el.toLibrary.onclick = () => goHome();
+el.playToggle.onclick = () => play();
 initPanels({ onGoTo: goToPage, onOpenNote: goToNote, getContext: noteContext, onSaveNotes: saveNotes });
 setToc([], "Open a book to see its contents.");
 setNotes([], { enabled: false, reason: "Open a book to take notes on it." });
