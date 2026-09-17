@@ -18,9 +18,14 @@ const PORT = Number(process.env.BLITZ_SMOKE_CDP_PORT || 9333);
 // diverged from the source tree once, when Python could not be read out of the
 // archive and the shipped app had no voice.
 const BIN = process.env.BLITZ_SMOKE_BIN;
+// Electron's own sandbox refuses to start under a root UID (crbug.com/638180)
+// -- true for CI containers and this repo's own dev sandbox alike. Opt in
+// explicitly rather than always passing --no-sandbox, since that flag weakens
+// the renderer sandbox and should not be the default for a real user's build.
+const EXTRA_ARGS = process.env.BLITZ_SMOKE_NO_SANDBOX ? ["--no-sandbox"] : [];
 const app = BIN
-  ? spawn(BIN, [`--remote-debugging-port=${PORT}`], { stdio: ["ignore", "pipe", "pipe"] })
-  : spawn("npx", ["electron", ".", `--remote-debugging-port=${PORT}`], {
+  ? spawn(BIN, [`--remote-debugging-port=${PORT}`, ...EXTRA_ARGS], { stdio: ["ignore", "pipe", "pipe"] })
+  : spawn("npx", ["electron", ".", `--remote-debugging-port=${PORT}`, ...EXTRA_ARGS], {
       stdio: ["ignore", "pipe", "pipe"],
     });
 const appLog = [];

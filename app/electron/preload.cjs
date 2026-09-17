@@ -18,6 +18,21 @@ contextBridge.exposeInMainWorld("blitz", {
   layoutReady: () => ipcRenderer.invoke("layout:ready"),
 
   /*
+   * display_formula regions only. PNG bytes (ArrayBuffer) of a crop
+   * re-rendered from the PDF at 300dpi (not the layout-analysis raster --
+   * see research/15-formula-recognition.md §2 on why) + the crop's pixel
+   * size -> { ok, latex, mathml, speech } or { ok: false, reason }. Never
+   * throws on a bad equation; a rejection is a normal result, per the
+   * project's own "never occlude, never render unconfident output" rule.
+   */
+  recognizeFormula: (pngArrayBuffer, size) =>
+    ipcRenderer.invoke("formula:recognize", pngArrayBuffer, size),
+  /** -> boolean -- true once the formula engine has finished loading */
+  formulaReady: () => ipcRenderer.invoke("formula:ready"),
+  /** -> boolean -- true if `npm run setup:formula` has been run at all */
+  formulaAvailable: () => ipcRenderer.invoke("formula:available"),
+
+  /*
    * The absolute path behind a picked or dropped File. A renderer only ever
    * sees a File object, which under context isolation carries no path --
    * `File.path` was removed in Electron 32 -- and webUtils is preload-only.
