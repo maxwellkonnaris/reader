@@ -2735,6 +2735,45 @@ const pad = (r) => ({
   h: r.h * 1.28,
 });
 
+/*
+ * The overlay's viewBox is a unit square stretched independently in x and y
+ * over whatever pixel box the page actually rendered at (preserveAspectRatio
+ * ="none", see paintRegions' note on this) -- so a single numeric rx/ry
+ * looks visibly elliptical on anything but a square page. This converts a
+ * real target pixel radius into the mismatched {rx, ry} fractions that read
+ * as one true circular corner once the SVG re-stretches them back out.
+ * Capped relative to the box's own height so a short word doesn't end up
+ * rounder than it is wide.
+ */
+function cornerRadius(p, boxHeightFrac, targetPx) {
+  const box = p.div.getBoundingClientRect();
+  const r = Math.min(targetPx, (boxHeightFrac * box.height) / 2);
+  return { rx: r / box.width, ry: r / box.height };
+}
+
+/**
+ * Which of a sentence's line rects the spotlight should punch out. Variant C
+ * used to hand paintBand every line a sentence spans, so a three-line
+ * sentence lit up all three lines the moment it started speaking. Readers
+ * expect the opposite of that -- a spotlight that tracks the one line
+ * actually being read and moves down as the word cursor wraps -- so this
+ * narrows the punch to just the line(s) under the current word, matched by
+ * the same "same vertical center" test mergeLines uses to decide two rects
+ * belong to one visual line. Before the first word of a sentence has timed
+ * in yet (or for a single-line sentence, where there's nothing to narrow),
+ * it falls back to the sentence's first/only line.
+ */
+function activeLineRects(p, sentence, wordIdxs) {
+  const lines = sentenceRects(p, sentence);
+  if (lines.length <= 1 || !wordIdxs.length) return lines.length ? [lines[0]] : lines;
+  const words = getWordRects(p, sentence);
+  const wordBoxes = wordIdxs.map((i) => words[i]).filter(Boolean).flatMap((w) => w.rects);
+  if (!wordBoxes.length) return [lines[0]];
+  const matched = lines.filter((line) =>
+    wordBoxes.some((w) => Math.abs((w.y + w.h / 2) - (line.y + line.h / 2)) < Math.max(w.h, line.h) * 0.55));
+  return matched.length ? matched : [lines[0]];
+}
+
 function paintBand(p, rects) {
   clearOverlay(p);
   if (!rects || !rects.length) return;
@@ -2748,13 +2787,15 @@ function paintBand(p, rects) {
       p.svg.append(rect(b.x, b.y + b.h - b.h * 0.13, b.w, b.h * 0.13, "rgba(226, 110, 20, 0.9)"));
     }
   } else {
-    // Spotlight: dim the whole page and punch the sentence out of the mask.
+    // Spotlight: dim the whole page and punch the current line out of the
+    // mask, corners softened to a real 6px so the punch reads as a deliberate
+    // rounded window onto the page rather than a sharp cutout.
     const id = `mask-${p.pn}`;
     const mask = document.createElementNS(SVG_NS, "mask");
     mask.setAttribute("id", id);
     mask.setAttribute("maskUnits", "userSpaceOnUse");
     mask.append(rect(0, 0, 1, 1, "#fff"));
-    for (const b of boxes) mask.append(rect(b.x, b.y, b.w, b.h, "#000"));
+    for (const b of boxes) mask.append(rect(b.x, b.y, b.w, b.h, "#000", cornerRadius(p, b.h, 6)));
     p.svg.append(mask);
     p.svg.append(rect(0, 0, 1, 1, "rgba(10, 12, 18, 0.42)", { mask: `url(#${id})` }));
   }
@@ -2767,7 +2808,30 @@ function paintBand(p, rects) {
  * stand out from the rest of an already-lit sentence without re-darkening
  * the page outside it (16's central design question).
  */
-function paintWordCursor(p, sentence, wordIdxs) {
+// Claude's own accent coral rather than the generic reading-app amber, per
+// ticket ask: word-level highlighting should read as this app's highlight,
+// not a stock yellow marker.
+const CURSOR_TINT = "rgba(217, 119, 87, 0.30)";
+const CURSOR_UNDERLINE = "rgba(196, 98, 66, 0.92)";
+const CURSOR_DIM = "rgba(10, 12, 18, 0.24)";
+
+/**
+ * The word cursor. Only meaningful inside variant C's punched-out hole — the
+ * hole is already at full brightness, so "highlight the current word" can't
+ * mean "make it brighter"; each style below finds a different way to make it
+ * stand out from the rest of an already-lit sentence without re-darkening
+ * the page outside it (16's central design question).
+ *
+ * `lineRects` is the same active-line rect set paintBand just punched the
+ * spotlight out of (activeLineRects), not the whole sentence — so "dim"'s
+ * inner mask recedes only the rest of the line actually on screen, and never
+ * re-covers lines the outer punch already dimmed away.
+ *
+ * Every shape here gets a real, pixel-accurate rounded corner (cornerRadius)
+ * so the cursor reads as a soft highlighter mark sitting precisely on the
+ * word, not a sharp box that happens to overlap it.
+ */
+function paintWordCursor(p, sentence, wordIdxs, lineRects) {
   if (cursorStyle.key === "off" || !sentence || !wordIdxs.length) return;
   const words = getWordRects(p, sentence);
   const wordBoxes = wordIdxs
@@ -2778,29 +2842,30 @@ function paintWordCursor(p, sentence, wordIdxs) {
 
   if (cursorStyle.key === "underline") {
     for (const b of wordBoxes) {
-      p.svg.append(rect(b.x, b.y + b.h - b.h * 0.11, b.w, b.h * 0.1, "rgba(255, 176, 32, 0.92)"));
+      const barH = b.h * 0.1;
+      p.svg.append(rect(b.x, b.y + b.h - barH, b.w, barH, CURSOR_UNDERLINE, cornerRadius(p, barH, 3)));
     }
     return;
   }
   if (cursorStyle.key === "tint") {
     for (const b of wordBoxes) {
-      p.svg.append(rect(b.x, b.y, b.w, b.h, "rgba(255, 200, 0, 0.26)"));
+      p.svg.append(rect(b.x, b.y, b.w, b.h, CURSOR_TINT, cornerRadius(p, b.h, 5)));
     }
     return;
   }
   // "dim": a second, fainter spotlight nested inside the first — gently
-  // recede the rest of the already-lit sentence, rather than marking the
-  // current word. Confined to the sentence's own rects, so it never touches
-  // the page outside the outer punch.
+  // recede the rest of the already-lit line, rather than marking the current
+  // word. Confined to the active line's own rects, so it never touches the
+  // page outside the outer punch.
   const id = `wordmask-${p.pn}`;
   const mask = document.createElementNS(SVG_NS, "mask");
   mask.setAttribute("id", id);
   mask.setAttribute("maskUnits", "userSpaceOnUse");
   mask.append(rect(0, 0, 1, 1, "#000"));
-  for (const b of sentenceRects(p, sentence).map(pad)) mask.append(rect(b.x, b.y, b.w, b.h, "#fff"));
-  for (const b of wordBoxes) mask.append(rect(b.x, b.y, b.w, b.h, "#000"));
+  for (const b of (lineRects ?? sentenceRects(p, sentence)).map(pad)) mask.append(rect(b.x, b.y, b.w, b.h, "#fff"));
+  for (const b of wordBoxes) mask.append(rect(b.x, b.y, b.w, b.h, "#000", cornerRadius(p, b.h, 5)));
   p.svg.append(mask);
-  p.svg.append(rect(0, 0, 1, 1, "rgba(10, 12, 18, 0.24)", { mask: `url(#${id})` }));
+  p.svg.append(rect(0, 0, 1, 1, CURSOR_DIM, { mask: `url(#${id})` }));
 }
 
 function paintAllBands(p) {
@@ -2872,8 +2937,11 @@ function repaint() {
       }
     } else if (speaking && speaking.pn === p.pn) {
       const s = p.sentences[speaking.si];
-      paintBand(p, s ? sentenceRects(p, s) : null);
-      if (variant.key === "C") paintWordCursor(p, s, activeWordIdxs);
+      // Variant C narrows to the one line the word cursor is on; A/B still
+      // band the whole sentence, which is what those two are for.
+      const bandRects = s && variant.key === "C" ? activeLineRects(p, s, activeWordIdxs) : s ? sentenceRects(p, s) : null;
+      paintBand(p, bandRects);
+      if (variant.key === "C") paintWordCursor(p, s, activeWordIdxs, bandRects);
     } else if (variant.key === "C" && speaking) {
       clearOverlay(p);
       p.svg.append(rect(0, 0, 1, 1, "rgba(10, 12, 18, 0.42)"));
