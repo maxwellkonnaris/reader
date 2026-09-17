@@ -2770,13 +2770,48 @@ const pad = (r) => ({
  * "not positioned perfectly on the word" describes. This hugs the glyphs
  * instead -- a snug highlighter pill, Speechify's own look, rather than a
  * shrunk line band.
+ *
+ * Kept deliberately small, on the strength of a direct measurement rather
+ * than a guess: a real PDF.js text layer's per-word Range.getClientRects()
+ * boxes, rendered with NO padding at all against a natively-typeset PDF
+ * (pdflatex output, proportional serif, real kerning), already landed
+ * within a pixel of every glyph -- see the debugWordBoxes(pn, si, true)
+ * "raw" mode below, which draws them unpadded for exactly this kind of
+ * check. An earlier version of this padded by several real pixels on the
+ * theory that PDF.js's text layer (it substitutes a generic sans-serif font
+ * for the invisible, selectable text, scaled once per line to match the
+ * PDF's real width -- see any span's `--scale-x`) drifts further off the
+ * true glyph position deeper into a line; measured gaps between consecutive
+ * words stayed a constant ~3px ten words into a line, no accumulating drift
+ * at all, and padding sized for that theory was big enough to make
+ * neighboring words' boxes overlap. So: a hairline only, just enough that
+ * cornerRadius's rounding doesn't read as a razor-cut selection box. If a
+ * *specific* PDF still looks off after this, it's much more likely a
+ * scanned/OCR'd book -- OCR word boxes are estimated from pixels, not exact
+ * vector positions, and can be off by more than a hairline unpredictably --
+ * which needs looking at that actual PDF, not a bigger constant here.
  */
-const padWord = (r) => ({
-  x: clamp01(r.x - r.h * 0.05),
-  y: clamp01(r.y - r.h * 0.05),
-  w: r.w + r.h * 0.10,
-  h: r.h * 1.10,
-});
+function padWord(p, r) {
+  const { dx, dy } = padPx(p, 1.5, 1);
+  return {
+    x: clamp01(r.x - dx),
+    y: clamp01(r.y - dy),
+    w: r.w + dx * 2,
+    h: r.h + dy * 2,
+  };
+}
+
+/**
+ * A real {pxX, pxY} pixel amount -> the page-fraction deltas that amount
+ * corresponds to along each axis right now, at the page's current zoom --
+ * shares cornerRadius's box-stretch reasoning (see its own note) and its
+ * box measurement, just without cornerRadius's own height-relative cap,
+ * which means nothing here for padding.
+ */
+function padPx(p, pxX, pxY) {
+  const box = p.div.getBoundingClientRect();
+  return { dx: (pxX * scale) / box.width, dy: (pxY * scale) / box.height };
+}
 
 /*
  * The overlay's viewBox is a unit square stretched independently in x and y
@@ -2880,7 +2915,7 @@ function paintWordCursor(p, sentence, wordIdxs, lineRects) {
   const wordBoxes = wordIdxs
     .map((i) => words[i])
     .filter(Boolean)
-    .flatMap((w) => w.rects.map(padWord));
+    .flatMap((w) => w.rects.map((r) => padWord(p, r)));
   if (!wordBoxes.length) return;
 
   if (cursorStyle.key === "underline") {
@@ -3565,7 +3600,7 @@ function paintWordHover(p) {
   const s = p.sentences[hoveredWord.si];
   const w = s && getWordRects(p, s)[hoveredWord.wi];
   if (!w) return;
-  for (const b of w.rects.map(padWord)) {
+  for (const b of w.rects.map((r) => padWord(p, r))) {
     p.svg.append(rect(b.x, b.y, b.w, b.h, "rgba(128, 128, 140, 0.14)", {
       stroke: "rgba(128, 128, 140, 0.5)", "stroke-width": 1.2,
       "vector-effect": "non-scaling-stroke", ...cornerRadius(p, b.h, 5),
@@ -4089,4 +4124,26 @@ window.__spike = {
   get cursorStyle() { return cursorStyle; },
   get fullScreen() { return isFullScreen; },
   get activeWordIdxs() { return activeWordIdxs; },
+  // Diagnostic for word-box alignment reports: draws every word's box in a
+  // sentence at once (not just the one word a real read would light up),
+  // reusing the exact shipped padWord/rect/cornerRadius path, so a
+  // screenshot shows precisely what ships. `raw: true` skips padding and
+  // rounding entirely -- the Range.getClientRects() measurement with
+  // nothing added -- which is the fastest way to tell "the underlying word
+  // rect is off" apart from "the padding/rounding made it look off" on a
+  // specific page someone reports as wrong.
+  debugWordBoxes(pn, si, raw) {
+    const p = pages.get(pn);
+    const s = p?.sentences[si];
+    if (!s) return null;
+    const words = getWordRects(p, s);
+    clearOverlay(p);
+    for (const w of words) {
+      const boxes = raw ? w.rects : w.rects.map((r) => padWord(p, r));
+      for (const b of boxes) {
+        p.svg.append(rect(b.x, b.y, b.w, b.h, "rgba(217, 119, 87, 0.35)", raw ? {} : cornerRadius(p, b.h, 5)));
+      }
+    }
+    return words.map((w) => w.text);
+  },
 };
