@@ -208,6 +208,15 @@
             <p class="muted tiny" id="layoutHint">Runs PP-DocLayoutV2 outside the window (~1.4s a page), so scrolling
               stays smooth. Groups each page into titles, paragraphs and figures so a click picks the
               paragraph you meant. Off means pages keep their default reading order.</p>
+
+            <label class="check">
+              <input id="connectiveSuperscripts" type="checkbox" />
+              Connective superscripts (experimental)
+            </label>
+            <p class="muted tiny" id="connectiveSuperscriptsHint">When the voice reaches a footnote or citation
+              marker mid-sentence, it pauses, reads the footnote it points to -- on the same page or later in
+              the document, wherever it actually is -- then picks back up exactly where it left off. Needs the
+              layout model above, so turning this on turns that on too.</p>
           </div>
         </details>
 

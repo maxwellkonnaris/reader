@@ -54,6 +54,7 @@ const el = {
   autoscroll: $("autoscroll"), showall: $("showall"), showRegions: $("showRegions"),
   layoutHint: $("layoutHint"),
   enableLayout: $("enableLayout"),
+  connectiveSuperscripts: $("connectiveSuperscripts"),
   state: $("state"), spoken: $("spoken"),
   sentences: $("sentences"), segcount: $("segcount"),
   pages: $("pages"), viewer: $("viewer"), drop: $("drop"),
@@ -186,6 +187,21 @@ let currentSpans = [];     // this sentence's [{start,end,words:[idx,...]}], tim
 let activeWordIdxs = [];   // word indices lit right now
 let rafId = null;
 const prefetchCache = new Map(); // "pn:si" -> Promise<{sr,audio_b64,words,spans}>
+
+// ------------------------------------------------------- connective superscripts (17)
+//
+// A second, wholly separate <audio> element for footnote/endnote detours.
+// Reusing audioEl for this would mean saving and restoring its currentTime,
+// src and blob URL around every detour -- fragile, and easy to desync from
+// the word loop. A second element sidesteps all of that: pausing the main
+// read is just audioEl.pause(), and resuming it is just audioEl.play() --
+// its position, src and blob are never touched by a detour at all.
+const detourAudioEl = new Audio();
+detourAudioEl.preload = "auto";
+let detourActive = false;       // true while main playback is paused for a detour
+let detourHighlight = null;     // {pn, rects} | null -- painted additively in repaint()
+let handledMarkers = new Set(); // word indices already detoured-to for the CURRENT `speaking` sentence
+const footnotePageTextCache = new Map(); // pn -> flattened plain text, for endnote search
 
 const VARIANTS = [
   { key: "A", name: "Tint" },
@@ -863,6 +879,14 @@ function syncLayoutControls() {
       : docKind === "pdf"
         ? "Runs PP-DocLayoutV2 outside the window (~1.4s a page), so scrolling stays smooth. Groups each page into titles, paragraphs and figures so a click picks the paragraph you meant. Off means pages keep their default reading order."
         : "Open a PDF to enable this.";
+  // Connective superscripts (17) is built entirely on the PDF path -- real
+  // glyph metrics from PDF.js, plus the layout model's own "footnote" /
+  // "reference_content" region labels -- neither of which an EPUB chapter's
+  // reflowable-HTML text has an equivalent of.
+  if (el.connectiveSuperscripts) {
+    el.connectiveSuperscripts.disabled = !isPdf;
+    if (!isPdf) el.connectiveSuperscripts.checked = false;
+  }
 }
 
 /**
@@ -2222,6 +2246,104 @@ function applyEpubTypography() {
 
 // ------------------------------------------------- sentences and geometry
 
+// Connective superscripts (17): a group's median real glyph height, used as
+// the baseline a superscript marker's own (smaller, raised) glyph is
+// measured against. Median rather than mean so one huge drop-cap or one
+// stray tiny artifact item can't skew the whole group's notion of "normal
+// text size".
+function groupBodyHeight(groupItems, textItems) {
+  const heights = groupItems
+    .map(({ divIdx }) => textItems?.[divIdx]?.height)
+    .filter((h) => h > 0)
+    .sort((a, b) => a - b);
+  return heights.length ? heights[heights.length >> 1] : 0;
+}
+
+// Digits or the standard footnote symbols only -- deliberately excludes
+// letters, so this never catches an ordinal suffix ("1st") or a trademark
+// sign, only an actual citation/footnote marker glyph.
+const FOOTNOTE_MARKER_RE = /^(\d{1,3}|[*†‡§¶])$/;
+const MARKER_SUFFIX_RE = /(\d{1,3}|[*†‡§¶])$/;
+const MARKER_PREFIX_RE = /^(\d{1,3}|[*†‡§¶])/;
+
+/**
+ * Empirically-derived thresholds (measured against a real footnote PDF via
+ * the CDP harness): a superscript marker's glyph runs 0.667-0.70x the body
+ * height and sits raised ~0.36x the body height above its neighbor's
+ * baseline. 0.78/0.15 give both real margin.
+ *
+ * A marker essentially never arrives as its own whitespace-delimited word.
+ * Measured directly on a real footnote PDF: PDF.js only emits a space
+ * between two items when the FIRST one has hasEOL set, so a superscript
+ * glued tight against the text on either side of it -- "phosphorylation.1"
+ * (glued to what precedes it) or "1This" (glued to what follows, the
+ * footnote's own leading marker) -- produces no space at all on that side.
+ * Both are checked, plus the (rarer, but real on some PDFs) case of a
+ * marker that genuinely is its own word. All three compare the candidate
+ * glyph against a *real neighboring glyph from the very same word*, found
+ * via this group's own locate() rather than raw index-adjacency into
+ * `textItems` -- raw adjacency can cross into a neighboring, differently-
+ * labeled region's item (measured: the item immediately before a footnote
+ * region's first item is often an empty hasEOL artifact, or the previous
+ * region's last line entirely), which would compare a marker against a
+ * baseline that was never actually near it on the page.
+ */
+function detectFootnoteMarkers(wordSpans, locate, textItems, bodyHeight) {
+  const glyph = (idx) => {
+    const loc = locate(idx);
+    const item = textItems[loc.divIdx];
+    if (!item || !(item.height > 0) || !item.transform) return null;
+    return { divIdx: loc.divIdx, height: item.height, y: item.transform[5] };
+  };
+  const isMarkerGlyph = (g) => g && g.height < bodyHeight * 0.78;
+  const isRaisedAbove = (g, baseline) => baseline != null && g.y - baseline > bodyHeight * 0.15;
+
+  const out = [];
+  for (let wi = 0; wi < wordSpans.length; wi++) {
+    const w = wordSpans[wi];
+
+    // Case 1: the whole word IS the marker -- real whitespace on both sides.
+    if (FOOTNOTE_MARKER_RE.test(w.text)) {
+      const a = glyph(w.ws), b = glyph(w.we - 1);
+      if (a && b && a.divIdx === b.divIdx && isMarkerGlyph(a)) {
+        const before = w.ws > 0 ? glyph(w.ws - 1) : null;
+        const after = glyph(w.we);
+        const baseline = before?.height > bodyHeight * 0.78 ? before.y : after?.height > bodyHeight * 0.78 ? after.y : null;
+        if (isRaisedAbove(a, baseline)) { out.push({ wi, marker: w.text, glued: null }); continue; }
+      }
+    }
+
+    // Case 2: glued onto the END of the word -- "...phosphorylation.1".
+    // markerStart-1 is the last real character of the body text this
+    // marker sits right after, guaranteed part of the same group (it's the
+    // previous character of this very word) and so a safe baseline.
+    const suffix = w.text.match(MARKER_SUFFIX_RE);
+    if (suffix && suffix[0].length < w.text.length) {
+      const markerStart = w.we - suffix[0].length;
+      const at = glyph(markerStart), end = glyph(w.we - 1), before = glyph(markerStart - 1);
+      if (at && end && at.divIdx === end.divIdx && (!before || before.divIdx !== at.divIdx)
+        && isMarkerGlyph(at) && isRaisedAbove(at, before?.y)) {
+        out.push({ wi, marker: suffix[0], glued: "suffix" });
+        continue;
+      }
+    }
+
+    // Case 3: glued onto the START of the word -- "1This" (a footnote/
+    // endnote block's own leading marker, almost always). markerEnd is the
+    // first real character of the note's own text, same reasoning as above.
+    const prefix = w.text.match(MARKER_PREFIX_RE);
+    if (prefix && prefix[0].length < w.text.length) {
+      const markerEnd = w.ws + prefix[0].length;
+      const at = glyph(w.ws), endOfMarker = glyph(markerEnd - 1), after = glyph(markerEnd);
+      if (at && endOfMarker && at.divIdx === endOfMarker.divIdx && (!after || after.divIdx !== at.divIdx)
+        && isMarkerGlyph(at) && isRaisedAbove(at, after?.y)) {
+        out.push({ wi, marker: prefix[0], glued: "prefix" });
+      }
+    }
+  }
+  return out;
+}
+
 function buildSentences(p, regions) {
   const strs = p.textLayer.textContentItemsStr;
   const divs = p.textLayer.textDivs;
@@ -2269,12 +2391,18 @@ function buildSentences(p, regions) {
   // segmenter pass makes that boundary structural, not punctuation-dependent.
   const groups = (regions && regions.length)
     ? groupByRegion(resolved, divs, box, regions)
-    : [resolved];
+    : [{ label: null, items: resolved }];
 
   const seg = new Intl.Segmenter("en", { granularity: "sentence" });
   const out = [];
 
-  for (const groupItems of groups) {
+  for (const { label, items: groupItems } of groups) {
+    // The layout model's own "footnote"/"reference_content" label on a
+    // region (constants.js's LABELS list has both) is what connective
+    // superscripts (17) matches a marker against later -- a per-group
+    // baseline glyph height, used to tell a superscript apart from ordinary
+    // small print, needs computing once per group rather than per word.
+    const bodyHeight = groupBodyHeight(groupItems, p.textContent.items);
     const parts = [];
     const items = [];
     let acc = 0;
@@ -2365,9 +2493,33 @@ function buildSentences(p, regions) {
           wordSpans.push({ text: m[0], ws: as + m.index, we: as + m.index + m[0].length });
         }
 
+        // Connective superscripts (17): flag which of this sentence's words
+        // are footnote/citation markers by real glyph metrics. Only
+        // meaningful with a nonzero bodyHeight, i.e. layout regions on --
+        // without regions there's no per-group baseline to compare against,
+        // so this quietly does nothing rather than false-positive on plain
+        // DOM order.
+        const footnoteMarkers = bodyHeight > 0
+          ? detectFootnoteMarkers(wordSpans, locate, p.textContent.items, bodyHeight)
+          : [];
+
+        let speech = text.replace(/[\u0000-\u001f]+/g, " ");
+        // A footnote block's own leading marker glyph often has no space
+        // glyph between it and the note's first word in the PDF's own
+        // content stream -- measured directly: "1This process was first
+        // characterized...". Patched here, structurally, only for a
+        // sentence whose own first word was just confirmed a real
+        // superscript marker -- never for an arbitrary sentence that merely
+        // starts with a digit ("3D printing" must stay "3D printing", not
+        // become "3 D printing").
+        if (footnoteMarkers[0]?.wi === 0) {
+          const cut = wordSpans[0].we - as;
+          if (/[A-Za-z]/.test(speech[cut] ?? "")) speech = `${speech.slice(0, cut)} ${speech.slice(cut)}`;
+        }
+
         out.push({
-          pn: p.pn, si: out.length, text, rects, wordSpans, words: null, unmapped,
-          speech: text.replace(/[\u0000-\u001f]+/g, " "),
+          pn: p.pn, si: out.length, text, rects, wordSpans, words: null, unmapped, label,
+          footnoteMarkers, speech,
           _locate: locate,
         });
       }
@@ -2477,12 +2629,12 @@ function groupByRegion(resolved, divs, box, regions) {
     const label = t.region >= 0 ? regions[t.region].label : null;
     const sameRun = current && (t.region === currentRegion || (label !== null && label === currentLabel));
     if (!sameRun) {
-      current = [];
+      current = { label, items: [] };
       groups.push(current);
       currentRegion = t.region;
       currentLabel = label;
     }
-    current.push(t.item);
+    current.items.push(t.item);
   }
   return groups;
 }
@@ -3034,6 +3186,15 @@ function repaint() {
       paintLoading(p, p.sentences[loadingSentence.si]);
     }
     if (hoveredWord?.pn === p.pn) paintWordHover(p);
+    // Connective superscripts (17): while a detour is mid-flight, show where
+    // the footnote actually is -- same-page only, since a cross-page
+    // endnote's page usually isn't rendered at all right now. A distinct
+    // blue keeps it visually separate from the main read's own highlight.
+    if (detourHighlight?.pn === p.pn) {
+      for (const b of detourHighlight.rects.map(pad)) {
+        p.svg.append(rect(b.x, b.y, b.w, b.h, "rgba(87, 169, 217, 0.38)"));
+      }
+    }
   }
 }
 
@@ -3073,13 +3234,35 @@ function scrollTo(p, rects) {
 
 // ---------------------------------------------------------------- playback
 
+// A footnote/endnote sentence is read on-demand, in context, via a detour
+// the moment its citing marker is hit -- so with the feature on, it must
+// NOT also get its own turn later in the normal page-order sequence, or
+// every footnote would be read twice (once in context, once in order).
+// With the feature off, these sentences behave exactly as before it
+// existed: read in their normal page-order turn like anything else.
+const FOOTNOTE_LABELS = new Set(["footnote", "reference_content", "reference"]);
+function isDetourOnlySentence(s) {
+  return Boolean(el.connectiveSuperscripts?.checked) && FOOTNOTE_LABELS.has(s?.label);
+}
+function firstNonDetourIndex(p, from) {
+  if (!p) return -1;
+  for (let si = from; si < p.sentences.length; si++) {
+    if (!isDetourOnlySentence(p.sentences[si])) return si;
+  }
+  return -1;
+}
+
 async function nextCursor(c) {
   if (!c) return null;
   const p = pages.get(c.pn);
-  if (p && c.si + 1 < p.sentences.length) return { pn: c.pn, si: c.si + 1 };
+  if (p) {
+    const si = firstNonDetourIndex(p, c.si + 1);
+    if (si >= 0) return { pn: c.pn, si };
+  }
   for (let pn = c.pn + 1; pn <= doc.numPages; pn++) {
     const np = await renderPage(pn);
-    if (np && np.sentences.length) return { pn, si: 0 };
+    const si = firstNonDetourIndex(np, 0);
+    if (si >= 0) return { pn, si };
   }
   return null;
 }
@@ -3188,11 +3371,18 @@ function sameWords(a, b) {
 function startWordLoop(gen) {
   const step = () => {
     if (gen !== generation) return;
+    // Frozen, not stopped, while a detour is mid-flight: audioEl itself is
+    // paused for the duration (see beginDetour), so its currentTime holds
+    // still on its own, but this guard also keeps a stray late frame from
+    // re-reading it the instant it's un-paused, before the resumed word is
+    // actually the one lit.
+    if (detourActive) { rafId = requestAnimationFrame(step); return; }
     const next = wordsAt(audioEl.currentTime);
     if (!sameWords(next, activeWordIdxs)) {
       activeWordIdxs = next;
       repaint();
     }
+    if (el.connectiveSuperscripts?.checked) maybeTriggerDetour(gen, next);
     rafId = requestAnimationFrame(step);
   };
   rafId = requestAnimationFrame(step);
@@ -3202,6 +3392,176 @@ function stopWordLoop() {
   if (rafId) cancelAnimationFrame(rafId);
   rafId = null;
   activeWordIdxs = [];
+}
+
+/**
+ * Connective superscripts (17): the moment the word cursor first reaches a
+ * footnote/citation marker -- not once its own short clip finishes playing
+ * -- pause the main read and go find what it points to. Triggering this
+ * early rather than waiting for the marker's audio to end is what makes
+ * this read as "the voice notices the footnote", not "the voice reads the
+ * digit, then also reads the footnote" -- and it means the marker's glyph
+ * never has to be stripped out of the text sent to Kokoro, which would
+ * otherwise risk desyncing the client's word indices from the server's own
+ * phoneme-span indices.
+ */
+function maybeTriggerDetour(gen, activeWords) {
+  if (!activeWords.length || !speaking) return;
+  const s = sentenceAt(speaking);
+  if (!s || !s.footnoteMarkers?.length) return;
+  for (const wi of activeWords) {
+    if (handledMarkers.has(wi)) continue;
+    const fm = s.footnoteMarkers.find((m) => m.wi === wi);
+    if (!fm) continue;
+    handledMarkers.add(wi);
+    beginDetour(gen, speaking, fm);
+    return; // one detour at a time; the rest of activeWords waits for the next tick
+  }
+}
+
+/**
+ * Pause the main read, resolve the marker to its footnote/endnote text
+ * (same page or elsewhere -- resolveFootnote tries both), speak it on the
+ * separate detour element, and resume exactly where the main read left off.
+ * A marker that resolves to nothing sayable (not found within the search
+ * range, or an empty note) is silently skipped -- the main read never
+ * stalls waiting on a footnote that isn't there.
+ */
+async function beginDetour(gen, c, fm) {
+  // Set (and pause) immediately, synchronously, before any await -- both so
+  // the main read stops the instant the marker is hit rather than
+  // continuing to play out loud while a (possibly slow, cross-page)
+  // resolveFootnote() looks the footnote up, and so this doubles as the
+  // lock against a second marker's word going active on the next rAF tick
+  // while this one is still resolving.
+  if (detourActive) return;
+  detourActive = true;
+  audioEl.pause();
+
+  const p = pages.get(c.pn);
+  let resolved;
+  try {
+    resolved = await resolveFootnote(p, fm.marker, c.pn);
+  } catch (e) {
+    console.warn("[tts] footnote resolution failed", e);
+    resolved = null;
+  }
+  if (gen !== generation) return; // playback moved on; leave audioEl as whatever speakOne set up next
+  if (!resolved || !/[A-Za-z]/.test(resolved.text)) {
+    // Nothing to say -- resume exactly as if this marker had never
+    // triggered anything.
+    detourActive = false;
+    audioEl.play().catch(() => {});
+    return;
+  }
+
+  detourHighlight = resolved.rects ? { pn: resolved.pn, rects: resolved.rects } : null;
+  const mainSpoken = el.spoken.textContent;
+  el.spoken.textContent = `↩ ${resolved.text}`;
+  repaint();
+
+  try {
+    const data = await fetchSynth(resolved.text, el.voice.value, synthSpeed);
+    if (gen !== generation) return;
+    const bytes = Uint8Array.from(atob(data.audio_b64), (ch) => ch.charCodeAt(0));
+    const url = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
+    detourAudioEl.src = url;
+    detourAudioEl.playbackRate = audioEl.playbackRate;
+    await new Promise((resolve) => {
+      detourAudioEl.onended = () => { URL.revokeObjectURL(url); resolve(); };
+      detourAudioEl.onerror = () => { URL.revokeObjectURL(url); resolve(); };
+      detourAudioEl.play().catch(() => resolve());
+    });
+  } catch (e) {
+    console.warn("[tts] footnote detour synth failed", e);
+  } finally {
+    if (gen === generation) {
+      detourActive = false;
+      detourHighlight = null;
+      el.spoken.textContent = mainSpoken;
+      repaint();
+      audioEl.play().catch(() => {});
+    }
+  }
+}
+
+/**
+ * Same-page footnotes and end-of-chapter/end-of-book endnotes both exist in
+ * real books ("Both, depending on the book"), so both get tried: first the
+ * cheap, precise one (a footnote-labeled region already on this rendered
+ * page, with real geometry to highlight), then the wider one (a numbered
+ * entry on a later page, found from raw PDF text -- no layout analysis, no
+ * rendering required, so it works on pages that were never scrolled to).
+ */
+async function resolveFootnote(p, marker, fromPn) {
+  const onPage = findFootnoteOnPage(p, marker);
+  if (onPage) return onPage;
+  if (docKind !== "pdf") return null; // endnote search below is PDF.js-only (doc.getPage)
+  return findEndnoteAhead(marker, fromPn);
+}
+
+/** A footnote sitting in its own layout-labeled region on the same page. */
+function findFootnoteOnPage(p, marker) {
+  if (!p?.sentences) return null;
+  for (const s of p.sentences) {
+    if (s.label !== "footnote" && s.label !== "reference_content" && s.label !== "reference") continue;
+    const fm = s.footnoteMarkers?.[0];
+    if (fm?.wi !== 0 || fm.marker !== marker) continue;
+    const stripped = s.speech.replace(/^\S+\s*/, "");
+    if (!stripped) continue;
+    return { text: stripped, pn: p.pn, rects: s.rects };
+  }
+  return null;
+}
+
+/** Flattened plain text of a page, straight from PDF.js -- cheap, and works
+ *  on a page that was never rendered as a PageEntry (endnotes are often
+ *  dozens of pages past whatever's currently on screen). Cached because a
+ *  read with several citations to the same endnotes section would otherwise
+ *  refetch and reflatten the same pages over and over. */
+async function endnotePageText(pn) {
+  if (footnotePageTextCache.has(pn)) return footnotePageTextCache.get(pn);
+  const page = await doc.getPage(pn);
+  const tc = await page.getTextContent();
+  let text = "";
+  let lastEOL = false;
+  for (const item of tc.items) {
+    if (lastEOL && item.str && !/^\s/.test(item.str)) text += "\n";
+    text += item.str;
+    lastEOL = Boolean(item.hasEOL);
+  }
+  footnotePageTextCache.set(pn, text);
+  return text;
+}
+
+// How far past the citing page to look before giving up on an endnote --
+// generous enough for "end of chapter" or "end of book" without scanning an
+// entire long PDF one citation at a time.
+const ENDNOTE_SEARCH_RANGE = 60;
+
+/**
+ * An endnotes section reads as a numbered list -- "1. ...", "1) ...", or a
+ * tab-separated "1\t..." -- with each entry starting its own line, which is
+ * what tells it apart from an inline citation (a marker glued mid-sentence
+ * never starts a line on its own). No layout model or rendering needed:
+ * just the page's own raw text, searched forward from the citing page.
+ */
+async function findEndnoteAhead(marker, fromPn) {
+  const last = Math.min(doc.numPages, fromPn + ENDNOTE_SEARCH_RANGE);
+  const escaped = marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`(?:^|\\n)[ \\t]*${escaped}[.)\\t][ \\t]*`, "m");
+  const nextEntryRe = /\n[ \t]*\d{1,3}[.)\t][ \t]/;
+  for (let pn = fromPn; pn <= last; pn++) {
+    let text;
+    try { text = await endnotePageText(pn); } catch { continue; }
+    const m = re.exec(text);
+    if (!m) continue;
+    const rest = text.slice(m.index + m[0].length);
+    const cut = rest.search(nextEntryRe);
+    const noteText = (cut >= 0 ? rest.slice(0, cut) : rest.slice(0, 600)).replace(/\s+/g, " ").trim();
+    if (noteText) return { text: noteText, pn, rects: null };
+  }
+  return null;
 }
 
 async function speakOne(c) {
@@ -3255,6 +3615,7 @@ async function speakOne(c) {
 
   loadingSentence = null;
   speaking = c;
+  handledMarkers = new Set(); // a fresh sentence means a fresh set of markers to watch for
   notePosition(c.pn, c.si);
   markToc(c.pn);
   currentSpans = data.spans;
@@ -3327,7 +3688,11 @@ async function play(from) {
   if (!start) {
     const p = await firstPageWithSentences();
     if (!p) return;
-    start = { pn: p.pn, si: 0 };
+    const si = firstNonDetourIndex(p, 0);
+    // -1 only when the very first page is nothing BUT footnotes/references,
+    // rare enough that falling back to si 0 (read it anyway) beats a play
+    // button that silently does nothing.
+    start = { pn: p.pn, si: si >= 0 ? si : 0 };
   }
   playing = true;
   updatePageNow();
@@ -4032,6 +4397,18 @@ el.enableLayout.onchange = () => {
   // itself for anything rendered from here on.
   for (const p of pages.values()) if (p.rendered && !p.regions) refineLayout(p);
 };
+el.connectiveSuperscripts.onchange = () => {
+  if (!el.connectiveSuperscripts.checked) return;
+  // Footnote detection needs the layout model's own region labels (a
+  // footnote block is only ever told apart from body text by its region,
+  // not by anything in the text itself) -- checking this box without it
+  // would silently do nothing, so turn that on too rather than leaving the
+  // reader to work out why superscripts aren't connecting.
+  if (!el.enableLayout.checked) {
+    el.enableLayout.checked = true;
+    el.enableLayout.onchange();
+  }
+};
 syncLayoutControls(); // no doc open yet -- starts disabled
 syncTypographyControls();
 
@@ -4146,4 +4523,11 @@ window.__spike = {
     }
     return words.map((w) => w.text);
   },
+  // Connective superscripts (17) test hooks: resolution is normally driven
+  // by the word loop mid-playback, which a harness would otherwise have to
+  // synthesize real audio just to exercise. These call the same resolution
+  // path directly, against whatever sentences/regions are already built.
+  resolveFootnote, findFootnoteOnPage, findEndnoteAhead, nextCursor,
+  get detourActive() { return detourActive; },
+  get detourHighlight() { return detourHighlight; },
 };
